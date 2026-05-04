@@ -1,300 +1,348 @@
 # Bonus Challenge — Topic D: Multimodal RAG trên 10M Document Pháp Lý
 
+> **Sinh viên:** Doumaa · VinUni AI20k · Day 18 Track 2
+
 ---
 
 ## 1. Problem Statement
 
-Một văn phòng luật VN cần hệ thống tra cứu thông minh trên **10 triệu document pháp lý** (bản án, nghị định, thông tư, hợp đồng mẫu). Document có 3 dạng: text thuần, ảnh scan (cần OCR), và bảng dữ liệu.
+Một văn phòng luật VN (50 luật sư, 2 engineer) cần hệ thống tra cứu thông minh trên **10 triệu document pháp lý** — bản án TAND, nghị định, thông tư, hợp đồng mẫu. Document gồm 3 dạng: text thuần (~60%), ảnh scan cần OCR (~25%), và bảng dữ liệu (~15%).
 
 **Tại sao khó:**
 
-- **Scale:** 10M PDF × trung bình 50 trang × 500 token/trang = **250 tỉ token raw** → sau chunking ~30 tỉ chunks
-- **Multimodal:** Không chỉ text — bảng điều khoản và ảnh scan chiếm ~40% nội dung quan trọng
-- **Reproducibility:** Khi một bản án năm 2026 trích dẫn "nghị định X version ngày 15/03/2021", hệ thống phải trả về **đúng version đó** dù document đã có 3 lần sửa đổi sau
-- **Embedding lifecycle:** Mỗi lần upgrade embedding model (text-embedding-ada-002 → text-embedding-3-large → model tương lai), **toàn bộ 30B chunks phải re-embed** — không thể downtime
-- **Latency:** Luật sư cần kết quả trong **p95 < 200ms** — không thể brute-force scan toàn bộ vectors
+- **Scale:** 10M PDF → **~30 tỉ chunks**.
+- **Multimodal:** Bảng điều khoản phạt và ảnh scan chiếm ~40% nội dung quan trọng — không chỉ text.
+- **Reproducibility 5 năm:** Khi bản án năm 2026 trích dẫn "NĐ 15/2020 version ngày 15/03/2021", retrieval phải trả đúng version đó — dù document đã qua 3 lần sửa đổi. Đây chính xác là use case **model reproducibility — pin training set version**.
+- **Embedding lifecycle:** `doc_v × model_v` = 2 chiều versioning. Mỗi lần upgrade model (e.g., ada-002 → text-embedding-3-large), 30B chunks phải re-embed — không downtime.
+- **Latency:** p95 < 200ms — vector DB = derived index cho online ANN.
+- **Compliance:** **Nghị định 13/2023/NĐ-CP**: dữ liệu pháp lý = sensitive data → data residency VN → on-prem MinIO, không cloud nước ngoài.
 
-**Constraints:** Môi trường on-prem (dữ liệu nhạy cảm, không ra cloud nước ngoài), 2-3 engineer, budget $15K/tháng.
+**Budget:** $15K/tháng recurring, on-prem.
 
 ---
 
 ## 2. Architecture Diagram
 
 ```
-┌─────────────────────────────────────────────────────────────────┐
-│  INGESTION PATH                                                 │
-│                                                                 │
-│  [PDF Upload API]                                               │
-│       │                                                         │
-│       ▼                                                         │
-│  ┌─────────┐    raw bytes + metadata    ┌──────────────────────┐│
-│  │ Kafka   │ ────────────────────────►  │ BRONZE               ││
-│  │ topic   │                            │ Delta Lake           ││
-│  │ pdf.raw │                            │ s3://lh-law/bronze/  ││
-│  └─────────┘                            │ partition: ingest_dt ││
-│                                         └──────────┬───────────┘│
-│                                                    │            │
-│                          OCR + Extract             │            │
-│                          (Unstructured.io)         ▼            │
-│                                         ┌──────────────────────┐│
-│                                         │ SILVER               ││
-│                                         │ Delta Lake           ││
-│                                         │ - doc_chunks         ││
-│                                         │ - tables (JSON)      ││
-│                                         │ - image_refs (S3)    ││
-│                                         │ partition: doc_date  ││
-│                                         └──────────┬───────────┘│
-│                                                    │            │
-│                          Embedding Model           │            │
-│                          (versioned)               ▼            │
-│                                         ┌──────────────────────┐│
-│                                         │ SILVER-EMBED         ││
-│                                         │ Lance dataset        ││
-│                                         │ v1/ v2/ v3/          ││
-│                                         │ (per model version)  ││
-│                                         └──────────┬───────────┘│
-│                                                    │            │
-│                          HNSW Index Build          ▼            │
-│                                         ┌──────────────────────┐│
-│                                         │ GOLD                 ││
-│                                         │ Lance + Delta        ││
-│                                         │ - HNSW index (Lance) ││
-│                                         │ - citation_log (Δ)   ││
-│                                         └──────────┬───────────┘│
-└────────────────────────────────────────────────────┼────────────┘
-                                                     │
-┌────────────────────────────────────────────────────▼────────────┐
-│  QUERY PATH                                                     │
-│                                                                 │
-│  [Luật sư gõ query]                                             │
-│       │                                                         │
-│       ▼                                                         │
-│  [Embed query] → [HNSW search ~50ms] → [Re-rank ~80ms]          │
-│       │                                                         │
-│       ▼                                                         │
-│  [Fetch chunks từ Silver (Delta)] → [LLM generate] → [Cite]     │
-│                                                                 │
-│  Total p95 target: < 200ms                                      │
-└─────────────────────────────────────────────────────────────────┘
+┌───────────────────────────────────────────────────────────────────────┐
+│ INGESTION PATH                                                        │
+│                                                                       │
+│ [PDF Upload API]                                                      │
+│      │                                                                │
+│      ▼                                                                │
+│ ┌─────────┐  raw bytes   ┌────────────────────────────────────────┐   │
+│ │ Kafka   │ ───────────► │ BRONZE (Delta Lake, MinIO on-prem)     │   │
+│ │ pdf.raw │              │ s3://lh-law/bronze/raw_docs            │   │
+│ └─────────┘              │ PARTITIONED BY (ingest_date)           │   │
+│                          │ Snappy compression (fast write)        │   │
+│                          │ Retention: 30d Standard → Glacier 5yr  │   │
+│                          └────────────────┬───────────────────────┘   │
+│                                           │                           │
+│                 Unstructured.io (on-prem) │ OCR + table extraction    │
+│                 Great Expectations gate   ▼                           │
+│                          ┌────────────────────────────────────────┐   │
+│                          │ SILVER (Delta Lake)                    │   │
+│                          │ s3://lh-law/silver/doc_chunks          │   │
+│                          │ PARTITIONED BY (doc_date)              │   │
+│                          │ Z-ORDER BY (doc_type, source)          │   │
+│                          │ ZSTD compression (slow write OK)       │   │
+│                          │ CDF enabled → downstream incremental   │   │
+│                          │ Deletion Vectors ON (GDPR delete)      │   │
+│                          └────────────────┬───────────────────────┘   │
+│                                           │                           │
+│                Embedding model (versioned)│ CDF → only embed changed  │
+│                doc_v × model_v tracking   ▼                           │
+│                          ┌────────────────────────────────────────┐   │
+│                          │ SILVER-EMBED (Lance)                   │   │
+│                          │ s3://lh-law/silver-embed/              │   │
+│                          │   ├── text-embedding-ada-002/ (frozen) │   │
+│                          │   ├── text-embedding-3-large/ (active) │   │
+│                          │   └── future-model/ (shadow build)     │   │
+│                          │ Native HNSW + versioning built-in      │   │
+│                          └────────────────┬───────────────────────┘   │
+│                                           │                           │
+│                Canary test (recall ≥ 98%) ▼                           │
+│                          ┌────────────────────────────────────────┐   │
+│                          │ GOLD (Delta + Lance)                   │   │
+│                          │ - HNSW index (Lance, query-ready)      │   │
+│                          │ - citation_log (Delta, audit trail)    │   │
+│                          │ - doc_quality_metrics (Delta)          │   │
+│                          │ ZSTD, Z-ORDER BY (query_date)          │   │
+│                          └────────────────┬───────────────────────┘   │
+└───────────────────────────────────────────┼───────────────────────────┘
+                                            │
+┌───────────────────────────────────────────▼───────────────────────────┐
+│ QUERY PATH (p95 < 200ms budget)                                       │
+│                                                                       │
+│ [Luật sư query] → [Embed ~30ms] → [HNSW ANN ~50ms] → [Re-rank ~40ms]  │
+│      → [Fetch chunks từ Silver Delta ~30ms] → [LLM generate] → [Cite] │
+│                                                                       │
+│ Vector DB = DERIVED INDEX, rebuildable                                │
+│ System of record = Delta tables (Bronze + Silver)                     │
+└───────────────────────────────────────────────────────────────────────┘
 ```
+
+**Compression strategy**: Bronze = Snappy (fast write, append-only); Silver/Gold = ZSTD (3× smaller, slow write OK for batch transforms).
 
 ---
 
 ## 3. Các Quyết Định Chính
 
-### Quyết định 1: Storage format cho embeddings — Lance vs Delta vs Parquet+FAISS
+### QĐ 1: Storage format — Iceberg vs Delta Lake vs Hudi
 
-**Chọn: Lance** cho embedding storage, **Delta Lake** cho metadata + chunks.
+**Chọn: Delta Lake** cho metadata/chunks, **Lance** cho embeddings.
 
-| | Lance | Delta Lake | Parquet + FAISS |
+| Tiêu chí | Delta Lake | Iceberg | Hudi |
 |---|---|---|---|
-| Native vector ops | ✅ ANN built-in | ❌ Cần external | ❌ Cần external |
-| ACID transactions | ✅ versioned | ✅ tốt nhất | ❌ không |
-| Random row access | ✅ fast | ❌ chậm | ❌ chậm |
-| Hệ sinh thái | Mới, nhỏ | Lớn, mature | Lớn nhưng phân mảnh |
+| Workload | Append + MERGE | Multi-engine | Mutation-heavy |
+| Hidden partitioning | ❌ Cần explicit | ✅ `days(ts)` auto-prune | ❌ |
+| Lab đã dùng | ✅ NB1–NB4 sẵn | ❌ Setup mới | ❌ |
+| Deletion Vectors | ✅ (v2.3+) | ✅ (v3) | ✅ (MOR) |
+| CDF (Change Data Feed) | ✅ Native | ❌ Cần external | ❌ |
+| Nessie branching | Tag only | ✅ Git-like | ❌ |
 
-**Loại Delta cho embeddings:** Delta tối ưu cho analytical workloads (batch scan), không cho vector lookup theo row ID. Đọc 1 vector từ Delta cần scan toàn bộ Parquet file của partition — quá chậm cho serving.
+**Lý do chọn Delta thay Iceberg:**
 
-**Loại Parquet+FAISS:** FAISS index không versioned, không có time travel, không có ACID — khi embedding model upgrade, không rollback được.
+Iceberg có hidden partitioning tốt hơn (đa số performance regression vì user quên partition column). Nhưng:
 
-**Trade-off chấp nhận:** Lance ecosystem còn mới (2023), ít tài liệu hơn Delta. Tuy nhiên đây là **phần khó nhất** của kiến trúc, và Lance là lựa chọn đúng đắn về kỹ thuật.
+1. **CDF là critical** cho embedding pipeline — chỉ re-embed chunks đã thay đổi, không toàn bộ 30B. Delta CDF native; Iceberg cần custom.
+2. **1 tuần deadline** — team đã quen Delta từ NB1–NB4 (chọn theo tooling fit).
+3. **Deletion Vectors** cho GDPR/Nghị định 13: `DELETE WHERE user_id=X` → 10–100× nhanh hơn rewrite.
+
+**Loại Hudi:** MOR fast update nhưng complex ops, team 2 người không đủ bandwidth debug.
+
+**Trade-off chấp nhận:** Mất hidden partitioning → phải explicit `PARTITIONED BY (doc_date)` + Z-ORDER. Team phải nhớ filter `doc_date` — anti-pattern #2 nếu quên (partition theo high-cardinality).
+
+**Lance cho embeddings** (Random access ~2000× faster than Parquet. Native HNSW. Built-in versioning.). Delta tối ưu cho batch scan, không cho vector lookup — đọc 1 embedding từ Delta = scan cả Parquet partition.
 
 ---
 
-### Quyết định 2: Vector Index — HNSW vs IVF-PQ vs Brute Force
+### QĐ 2: Vector Index — HNSW (tiered) vs IVF-PQ vs Brute Force
 
-**Chọn: HNSW (Hierarchical Navigable Small World)**
+**Chọn: Tiered HNSW** — hot tier trên RAM, cold tier trên disk.
 
-| | HNSW | IVF-PQ | Brute Force |
+| | HNSW (hot) | IVF-PQ (cold) | Brute Force |
 |---|---|---|---|
-| Build time | Chậm hơn | Nhanh | Không cần |
-| Query latency | ~5-20ms | ~10-30ms | O(N) — không khả thi |
+| Query latency | ~5-20ms | ~10-30ms | O(N) |
 | Recall@10 | 98%+ | 90-95% | 100% |
-| RAM usage | ~100 GB cho 30B chunks | ~10-20 GB (quantized) | N/A |
-| Incremental add | ✅ Tốt | ❌ Cần rebuild | N/A |
+| RAM | ~100 GB (20% corpus) | ~10-20 GB (quantized) | N/A |
 
-**Loại IVF-PQ:** Recall thấp hơn (quantization mất thông tin) — với văn bản pháp lý, bỏ sót 5-10% kết quả liên quan có thể gây hậu quả nghiêm trọng (luật sư bỏ lỡ án lệ quan trọng).
+**Loại IVF-PQ cho hot tier:** PQ quantization mất thông tin → recall 90-95%. Trong domain pháp lý, bỏ sót 5-10% kết quả = bỏ lỡ án lệ quan trọng. Vector DB = derived index → rebuild được, nên chọn recall cao.
 
-**Loại Brute Force:** 30B vectors × 1536 dims = không thể scan trong 200ms.
+**Loại Brute Force:** 30B vectors × 1536 dims × 4 bytes = 180 TB. Scan 180 TB trong 200ms = vô lý.
 
-**Trade-off chấp nhận:** HNSW cần ~100GB RAM cho full index. Giải pháp: **tiered HNSW** — index "hot" (5 năm gần nhất, ~20% corpus) trên RAM, "cold" (cũ hơn) query qua IVF-PQ trên disk.
-
----
-
-### Quyết định 3: OCR Pipeline — Unstructured.io vs Tesseract vs Azure Document Intelligence
-
-**Chọn: Unstructured.io (self-hosted)**
-
-**Loại Tesseract:** Chỉ xử lý ảnh → text, không hiểu cấu trúc bảng, layout. Với văn bản pháp lý VN (bảng điều khoản phức tạp), Tesseract cho output hỗn độn — không thể parse bảng thành JSON.
-
-**Loại Azure Document Intelligence:** Cloud-based → dữ liệu pháp lý nhạy cảm không được ra ngoài. Vi phạm yêu cầu on-prem.
-
-**Trade-off chấp nhận:** Unstructured.io self-hosted cần GPU server riêng (~$2K/tháng). Nhưng đây là bất khả kháng vì constraint on-prem.
+**Tiered approach:** Hot tier = 5 năm gần nhất (~20% corpus, ~6B vectors) → fit 100 GB RAM HNSW. Cold tier = cũ hơn → IVF-PQ trên disk, chấp nhận recall thấp hơn cho query hiếm.
 
 ---
 
-### Quyết định 4: Embedding Versioning — Separate datasets vs Column-based
+### QĐ 3: OCR Pipeline — Unstructured.io (on-prem) vs Tesseract vs Azure Doc Intelligence
 
-**Chọn: Separate Lance datasets per model version**
+**Chọn: Unstructured.io self-hosted**
+
+**Loại Azure Doc Intelligence:** Nghị định 13/2023/NĐ-CP: sensitive data → data residency VN. Document pháp lý không được gửi cloud nước ngoài.
+
+**Loại Tesseract:** Chỉ ảnh → text, không hiểu table layout. Bảng điều khoản phạt trong hợp đồng VN = multi-column → Tesseract output hỗn độn.
+
+**Trade-off:** Unstructured.io on-prem cần GPU server ($2K/tháng). Bất khả kháng vì constraint on-prem.
+
+---
+
+### QĐ 4: Embedding versioning — Separate Lance datasets vs Column-based
+
+**Chọn: Separate Lance datasets per `model_v`**
+
+Embedding version = `doc_v × model_v` → pin via Delta version + MLflow run_id.
 
 ```
 s3://lh-law/silver-embed/
   ├── text-embedding-ada-002/    ← v1, frozen sau khi v2 ready
-  ├── text-embedding-3-large/    ← v2, active
-  └── future-model/              ← v3, đang migrate
+  ├── text-embedding-3-large/    ← v2, active serving
+  └── future-model/              ← v3, shadow build (canary test chưa pass)
 ```
 
-**Loại Column-based** (thêm column `embedding_v2` vào bảng cũ): Với 30B chunks × 1536 dims × 4 bytes × 2 versions = **360 TB** chỉ cho 2 versions. Không khả thi về storage và query performance.
+**Loại Column-based** (thêm `embedding_v2` column): 30B × 1536 dims × 4 bytes × 2 versions = **360 TB** trong 1 table. Scan cost gấp đôi cho mọi query.
 
-**Trade-off chấp nhận:** Mỗi version dataset là một copy hoàn toàn của 30B vectors. Migration v1 → v2 cần chạy song song ~2-4 tuần. Trong thời gian này, dùng v1 serve production, v2 build shadow index.
+**Migration flow** (zero-downtime):
 
----
+1. **Full re-embed toàn bộ 30B chunks** với model v2 (background job, ~2-4 tuần) — migration model mới = không gian vector hoàn toàn khác, không tương thích với v1, phải embed lại tất cả.
+2. Canary test 100 queries → recall ≥ 98% so với expected → pass → swap pointer
+3. Keep v1 frozen 30 ngày → archive S3 IA → Glacier sau 90d
+4. `citation_log` ghi `embed_model_version` + `silver_delta_version` mỗi query → audit trail reproducibility
 
-### Quyết định 5: Catalog — Lakekeeper REST Catalog vs Unity Catalog vs Hive Metastore
-
-**Chọn: Lakekeeper (REST Catalog, open-source)**
-
-**Loại Unity Catalog:** Vendor lock-in vào Databricks. On-prem deployment phức tạp, expensive license.
-
-**Loại Hive Metastore:** Không hỗ trợ Lance format, không có REST API chuẩn, khó integrate với RAG serving stack.
-
-**Lakekeeper:** Open-source, REST Catalog spec (Iceberg-compatible), chạy được on-prem, multi-engine (Spark + DuckDB + trực tiếp query từ Python). Trade-off: mới hơn, community nhỏ hơn.
+> **CDF (Change Data Feed)** hữu ích cho **ongoing incremental** sau khi migration xong: chỉ re-embed chunks mới thêm hoặc đã sửa nội dung trong cùng model version. Không giúp được khi đổi model vì toàn bộ vector space thay đổi.
 
 ---
 
-### Quyết định 6: Chunking strategy — Fixed-size vs Semantic chunking
+### QĐ 5: Catalog — Lakekeeper vs Unity Catalog vs Nessie
 
-**Chọn: Fixed-size 512 tokens với 50% overlap, nhưng respect document structure**
+**Chọn: Lakekeeper** (REST Catalog, Rust, K8s-native)
 
-Logic: Với văn bản pháp lý, một điều khoản thường là 200-600 tokens. Fixed-size 512 với overlap đảm bảo không cắt đứt điều khoản. Semantic chunking (tách theo câu/đoạn) cho recall tốt hơn nhưng tạo ra chunks không đều — khó estimate storage và index size.
+REST Catalog spec = lingua franca 2026.
 
-**Trade-off chấp nhận:** ~30B chunks thay vì ~20B (nếu semantic chunking tốt hơn). Đổi lại: deterministic, reproducible, dễ debug.
+| | Lakekeeper | Unity Catalog | Nessie |
+|---|---|---|---|
+| Open-source | ✅ Rust, lightweight | ✅ (2024 OSS) | ✅ |
+| On-prem deploy | ✅ K8s-native | ❌ Phức tạp | ✅ |
+| Git-like branching | ❌ | ❌ | ✅ |
+| Multi-engine | ✅ REST spec | Databricks-native | ✅ |
+
+**Loại Nessie:** Git-like branching rất hấp dẫn cho embedding version migration (`nessie branch create exp-2026`). Nhưng Nessie chưa hỗ trợ Lance format, chỉ Iceberg. Nếu sau này migrate sang Iceberg + Lance hybrid, Nessie là candidate đầu tiên.
+
+**Loại Unity Catalog:** Vendor lock-in Databricks. On-prem deployment = expensive license, không hợp budget $15K/tháng.
+
+---
+
+### QĐ 6: Data Quality — 2-tool stack
+
+**Chọn: dbt tests + Soda** (bỏ Great Expectations riêng cho team 2 người)
+
+| Gate | Tool | Kiểm tra gì |
+|---|---|---|
+| Bronze → Silver | **dbt tests** | `ocr_confidence > 0.85`, unique `chunk_id`, not_null `doc_id`, FK → `bronze.raw_docs`, table structure validation |
+| Production monitoring | **Soda** | `freshness < 1h`; `row_count >= expected`; anomaly detection trên query latency |
+
+**Loại Great Expectations riêng:** dbt tests đã cover phần lớn use case của GE (not_null, unique, accepted_values, custom SQL tests). Duy trì 3 tool stack = 3 places để debug khi pipeline fail — overhead quá cao cho team 2 engineer. Chỉ giữ lại GE nếu OCR validation cần expectations phức tạp dbt không handle được (ví dụ: distribution-based checks trên `ocr_confidence`).
+
+Data Contract giữa OCR team → embedding team → RAG serving: schema + constraints + freshness SLA. Bể contract → block pipeline, không pass bad data downstream (run trong CI pre-merge và runtime per-batch).
+
+---
+
+### QĐ 7: Chunking strategy — Fixed-size 512 vs Semantic chunking
+
+**Chọn: Fixed-size 512 tokens, 50% overlap, respect heading boundaries**
+
+**Loại Semantic chunking:** Cho recall tốt hơn nhưng **non-deterministic** — cùng document, khác sentence splitter → khác chunks → khác embeddings → **không reproducible** sau 5 năm. Contradicts core requirement.
+
+**Trade-off:** ~30B chunks thay vì ~20B (nhiều hơn ~50%). Đổi lại: deterministic, reproducible, dễ estimate storage.
 
 ---
 
 ## 4. Failure Modes
 
-### Failure 1: Embedding model deprecation (Day 18 concept: time travel)
+### Failure 1: Embedding model deprecated → stale vectors
 
-**Kịch bản:** OpenAI thông báo `text-embedding-ada-002` ngừng hỗ trợ sau 6 tháng. Toàn bộ 30B vectors v1 phải migrate sang `text-embedding-3-large`.
+**Kịch bản 3h sáng:** OpenAI deprecate `text-embedding-ada-002` trong 6 tháng. Toàn bộ 30B vectors v1 phải migrate.
 
-**Phát hiện:** Monitor OpenAI deprecation announcements + alert khi model API trả về deprecation warning header.
+**Detect:** Monitor deprecation announcements + alert khi API trả về deprecation warning header.
 
-**Rollback:** Lance datasets versioned — nếu v2 migration bị lỗi (recall giảm, wrong results), có thể switch serving pointer về v1 trong < 5 phút:
+**Rollback:** Lance datasets versioned — nếu v2 migration bị lỗi (recall giảm):
 
 ```python
-# Atomic pointer swap — không cần rebuild index
-catalog.update_serving_version("silver-embed", version="text-embedding-ada-002")
+catalog.update_serving_pointer("silver-embed", version="text-embedding-ada-002")
 ```
 
-Delta `citation_log` ghi lại mọi query đã dùng version nào → audit trail đầy đủ.
+Atomic pointer swap, < 5 phút, zero downtime. Delta `citation_log` ghi mọi query đã dùng version nào → biết user nào bị ảnh hưởng. Đây chính là use case **"model reproducibility — pin training set version"** nhưng áp dụng cho embedding serving thay vì training.
 
 ---
 
-### Failure 2: OCR extraction sai bảng → hallucination
+### Failure 2: OCR parse sai bảng → luật sư nhận thông tin sai
 
-**Kịch bản:** Unstructured.io parse sai bảng điều khoản phạt trong hợp đồng (nhầm cột) → LLM generate ra số tiền phạt sai → luật sư tư vấn nhầm cho khách hàng.
+**Kịch bản:** Unstructured.io parse sai bảng điều khoản phạt → nhầm cột "mức phạt" với "thời hạn" → LLM generate số sai → luật sư tư vấn nhầm cho khách hàng.
 
-**Phát hiện:** Great Expectations check tại Silver gate:
+**Detect:** Great Expectations gate tại Bronze → Silver:
 
-- `table_cell_count` phải match với metadata từ PDF parser
-- Số trong bảng phải là numeric (không phải string lẫn lộn)
-- Cross-validate: nếu 2 OCR engine (Unstructured + PaddleOCR) disagreement > 10% → flag for human review
+- `table_cell_count` match metadata
+- Cross-validate: Unstructured vs PaddleOCR disagreement > 10% → flag `review_status = "pending"`
 
-**Rollback:** Chunk bị flag → `review_status = "pending"` trong Delta Silver → không được index vào Lance → không thể retrieve cho đến khi human approve.
+**Rollback:** Chunk bị flag → không index vào Lance → không thể retrieve. Human review trước khi approve. (bể contract → block pipeline)
 
 ---
 
-### Failure 3: Document bị xóa nhầm + bản án mất reference
+### Failure 3: Document xóa nhầm + bản án mất reference
 
-**Kịch bản:** Admin xóa nhầm "Nghị định 15/2020" khỏi system. Một bản án năm 2022 đang trích dẫn nghị định này → khi luật sư query về bản án đó, reference không còn tồn tại.
+**Kịch bản:** Admin xóa nhầm "NĐ 15/2020". Bản án 2022 trích dẫn nghị định này → reference broken.
 
-**Phát hiện:** Foreign key check trong `citation_log` Delta table: nếu `source_doc_id` không còn tồn tại trong Silver → alert ngay lập tức.
+**Detect:** FK check `citation_log.source_doc_id` ∉ Silver → alert.
 
-**Rollback (Day 18 — Delta time travel):**
+**Rollback (`restoreToVersion`):**
 
 ```sql
--- Restore document về trước khi xóa
-RESTORE TABLE silver.doc_chunks
-VERSION AS OF <version_before_delete>
-WHERE doc_id = 'nghi-dinh-15-2020';
+RESTORE TABLE silver.doc_chunks VERSION AS OF <before_delete>;
+-- Delta retention 1825 days (5 năm) → restore bất kỳ document nào
 ```
 
-Vì Delta giữ 5 năm retention (`delta.logRetentionDuration = 1825 days`), có thể restore bất kỳ document nào bị xóa nhầm.
+**Nhưng VACUUM là risk:** Nếu VACUUM chạy → physical files bị xóa → không restore được. Vì vậy:
+
+- `delta.deletedFileRetentionDuration = 1825 days` (dài = nhiều cost, audit tốt)
+- Anti-pattern #4: **KHÔNG BAO GIỜ** `VACUUM 0 HOURS` trên table pháp lý
 
 ---
 
-### Failure 4: HNSW index corruption sau rebuild
+### Failure 4: Right-to-forget request
 
-**Kịch bản:** Sau lần re-index hàng tuần, HNSW index bị corrupt (disk failure giữa chừng) → query trả về garbage results hoặc crash.
+**Kịch bản:** Đương sự yêu cầu xóa thông tin cá nhân theo Nghị định 13/2023/NĐ-CP.
 
-**Phát hiện:** Canary query set — 100 câu hỏi pháp lý với expected top-1 kết quả. Sau mỗi lần rebuild, tự động chạy canary. Nếu recall@1 < 90% → không switch sang index mới.
+**Approach:**
 
-**Rollback:** Giữ 2 index versions (current + previous). Switch pointer về previous trong < 1 phút:
+1. `DELETE FROM silver.doc_chunks WHERE contains_pii_of(user_id=X)` — dùng **Deletion Vectors**: không rewrite cả Parquet file, chỉ ghi bitmap sidecar. 10–100× nhanh hơn rewrite, đủ đáp ứng **72h SLA**.
+2. Ghi audit log ngay vào `gold.pii_deletion_log` — bằng chứng compliance Nghị định 13 (soft delete đã xong).
+3. Rebuild affected Lance embeddings (xóa vectors của deleted chunks).
+4. Scheduled VACUUM (không phải 0 HOURS): chạy định kỳ hàng tuần để physical removal.
 
-```python
-serving.swap_index(target="previous")
-# Downtime: 0s (atomic pointer swap)
-```
+**Lưu ý kỹ thuật về VACUUM:**
+
+- Delta **không hỗ trợ** `VACUUM WHERE partition=X` — VACUUM chạy trên toàn bộ table.
+- Delta mặc định **chặn** `RETAIN < 7 days`, cần: `spark.conf.set("spark.databricks.delta.retentionDurationCheck.enabled", "false")` — override nguy hiểm, chỉ dùng khi có legal mandate.
+- Với table pháp lý retention 5 năm: chỉ VACUUM khi có yêu cầu right-to-forget cụ thể, không scheduled thường xuyên.
+
+**Conflict: Reproducibility vs GDPR delete.** Sau VACUUM, time travel cho chunks đó không còn. Giải pháp: `citation_log` giữ `chunk_id` + `query_ts` nhưng **không giữ chunk content** — đủ cho audit trail, PII đã physical delete.
 
 ---
 
-## 5. Ước Tính Chi Phí (Back-of-envelope)
+## 5. Ước Tính Chi Phí (Show the Math)
+
+**Methodology:** Dùng on-prem MinIO (Nghị định 13), estimate theo S3 pricing tương đương.
 
 ### Storage
 
-| Layer | Size | Tier | $/tháng |
-|---|---|---|---|
-| Bronze (raw PDF) | 10M PDF × 5MB avg = 50 TB | S3 IA (ít access) | $575 |
-| Silver (chunks + tables) | ~5 TB Delta Parquet | S3 Standard | $115 |
-| Silver-Embed v1 (frozen) | 30B × 1536 × 4B = 180 TB | S3 IA | $2,070 |
-| Silver-Embed v2 (active) | 180 TB | S3 Standard | $4,140 |
-| Gold HNSW index (hot tier) | ~100 GB RAM serving | EC2 r6g.4xlarge | $730 |
-| Gold HNSW index (cold tier) | ~5 TB on disk | S3 Standard | $115 |
-| **Storage total** | | | **~$7,745/tháng** |
+| Layer | Calculation | Size | Tier | $/tháng |
+|---|---|---|---|---|
+| Bronze (raw PDF) | 10M × 5 MB avg | 50 TB | Snappy, IA sau 30d | $575 |
+| Silver (chunks + tables) | 30B chunks × ~170 bytes avg (ZSTD) | ~5 TB | Standard | $115 |
+| Silver-Embed v1 (frozen) | 30B × 1536 dims × 4 bytes | 180 TB | IA (frozen) | $2,070 |
+| Silver-Embed v2 (active) | 30B × 1536 dims × 4 bytes | 180 TB | Standard | $4,140 |
+| Gold (HNSW hot) | 20% corpus on RAM | ~100 GB | EC2 r6g.4xlarge | $730 |
+| Gold (citation_log + metrics) | Negligible | <1 GB | Standard | ~$0 |
+| **Storage total** | | | | **~$7,630/tháng** |
 
 ### Compute
 
 | Component | Spec | $/tháng |
 |---|---|---|
-| OCR processing (one-time backfill) | GPU g4dn.xlarge × 30 ngày | $3,024 |
-| OCR processing (ongoing, ~5K doc/ngày) | g4dn.xlarge × 8h/ngày | $403 |
-| Embedding generation (backfill, one-time) | OpenAI API 30B tokens | ~$15,000 one-time |
-| Embedding ongoing (~5K doc/ngày) | OpenAI API ~15M tokens/ngày | $450 |
-| HNSW serving (hot index) | r6g.4xlarge (128GB RAM) | $730 |
+| OCR ongoing (~5K doc/ngày) | g4dn.xlarge × 8h/ngày on-prem | $403 |
+| Embedding ongoing | ~15M tokens/ngày × $0.0001/1K | $450 |
+| HNSW serving | r6g.4xlarge (128 GB RAM) | $730 |
 | RAG API + re-ranker | c6g.2xlarge × 2 | $296 |
-| **Compute total (recurring)** | | **~$1,879/tháng** |
+| **Compute total** | | **~$1,879/tháng** |
 
-**Tổng recurring: ~$9,600/tháng** (dưới budget $15K)
-**One-time migration cost: ~$18K** (embedding backfill + OCR backfill)
+**Tổng recurring: ~$9,500/tháng** (dưới budget $15K/tháng)
+
+**One-time backfill:**
+
+- OCR 10M PDF: GPU g4dn.xlarge × 60 ngày = ~$6,000
+- Embedding 30B tokens: $3,000 (text-embedding-3-small) hoặc $15,000 (text-embedding-3-large)
+
+**FinOps rules** (savings chỉ materialize nếu actively optimize):
+
+- Bronze → Glacier sau 30d (ít re-access): giảm ~60% bronze storage
+- Silver-Embed v1 frozen → IA ngay sau swap: giảm ~40%
+- `OPTIMIZE` nightly cron trên Silver: "bỏ qua OPTIMIZE → 10× chậm"
+- KHÔNG chạy Spark cluster cho Silver query < 100 GB → DuckDB
 
 ---
 
 ## 6. MVP 1 Tuần
 
-**Mục tiêu:** Prove rằng kiến trúc hoạt động trên 1,000 document mẫu — không cần 10M.
+**Mục tiêu:** Prove kiến trúc trên 1,000 document mẫu — không cần 10M.
 
 | Day | Task | Deliverable | Risk |
 |---|---|---|---|
-| D1 | Bronze ingest: PDF → Delta (1K doc mẫu, mixed text/scan) | `bronze.raw_docs` table, `_delta_log/` visible | Thấp |
-| D2 | Silver extraction: Unstructured.io local → text chunks + table JSON | `silver.doc_chunks` với structured tables | Trung bình (OCR setup) |
-| D3 | Embedding generation → Lance dataset v1 | `silver-embed/text-embedding-3-small/` Lance dataset | Thấp |
-| D4 | HNSW index build + search API (FastAPI) | Query "điều khoản bồi thường" → top-5 chunks trong 200ms | Trung bình |
-| D5 | Embedding version migration demo: v1 → v2 (khác model) | Parallel index, atomic swap, recall comparison | **Cao** — đây là phần khó nhất |
-| D6 | Reproducibility test: query tại `VERSION AS OF` cụ thể | Cùng query, cùng version → cùng kết quả sau 1 tuần | Trung bình |
-| D7 | Buffer + writeup + slide | `ARCHITECTURE.md` + slide + PoC notebook | Thấp |
+| D1 | Bronze ingest: 1K PDF → Delta (MinIO on-prem) | `bronze.raw_docs` có `_delta_log/` visible trên MinIO console | Thấp |
+| D2 | Silver extraction: Unstructured.io → chunks + table JSON. Great Expectations gate. | `silver.doc_chunks` với `ocr_confidence` và `review_status` | Trung bình |
+| D3 | Embedding v1 → Lance dataset. Pin Delta version + model version. | `silver-embed/text-embedding-3-small/` Lance dataset | Thấp |
+| D4 | HNSW build + FastAPI search. Benchmark p95 latency. | Query "điều khoản bồi thường" → top-5 trong < 200ms | Trung bình |
+| D5 | **Embedding migration v1→v2.** Shadow build, canary test, atomic swap. | Parallel Lance datasets, recall comparison, pointer swap | **Cao** |
+| D6 | **Reproducibility test.** Query tại `VERSION AS OF` + citation_log replay. | Cùng query + cùng version → cùng kết quả sau 1 tuần | Trung bình |
+| D7 | Buffer + writeup | `ARCHITECTURE.md` | Thấp |
 
-**Slice nhỏ nhất shippable (nếu chỉ có 3 ngày):** D1 + D3 + D5 — chứng minh được phần khó nhất (embedding versioning + migration) mà không cần full OCR pipeline.
-
----
-
-## Tự đánh giá theo rubric
-
-| Dimension | Trạng thái |
-|---|---|
-| ≥ 5 quyết định kèm alternatives đã loại | ✅ 6 quyết định |
-| Constraints & numbers xuyên suốt | ✅ 30B chunks, 200ms, $9.6K/tháng |
-| Liên hệ ≥ 4 concepts Day 18 | ✅ Delta, ACID, time travel, medallion, Z-ORDER |
-| Failure modes 3h sáng + rollback | ✅ 4 scenarios |
-| Cost back-of-envelope | ✅ Show the math |
-| MVP slice nhỏ nhất | ✅ D1+D3+D5 |
+**Slice nhỏ nhất shippable (3 ngày):** D1 + D3 + D5 — prove phần khó nhất (embedding versioning + migration) mà không cần full OCR pipeline. Dùng text-only PDF, skip OCR.
