@@ -47,13 +47,14 @@ services:
       AWS_ACCESS_KEY_ID: minioadmin
       AWS_SECRET_ACCESS_KEY: minioadmin
       AWS_REGION: us-east-1
-      PYTHONPATH: /workspace/scripts
+      PYTHONPATH: /workspace/scripts:/usr/local/spark/python:/usr/local/spark/python/lib/py4j-0.10.9.7-src.zip
     volumes:
       - ../:/workspace
       # Ivy cache survives restarts → Maven JARs only download once
       - ivy-cache:/home/jovyan/.ivy2
       - ipython-cache:/home/jovyan/.cache
     working_dir: /workspace
+    user: root
     command:
       - bash
       - -c
@@ -65,9 +66,12 @@ services:
           jupytext==1.16.4 \
           faker==30.3.0
         echo ">> Auto-converting .py percent files to .ipynb (one-time per file)…"
-        cd /workspace/notebooks && for f in *.py; do
-          ipynb="${f%.py}.ipynb"
-          [ -f "$ipynb" ] || jupytext --to notebook "$f"
+        cd /workspace && for d in notebooks notebooks-spark; do
+          [ -d "$$d" ] && cd "$$d" && for f in *.py; do
+            [ -e "$$f" ] || continue
+            ipynb="$${f%.py}.ipynb"
+            [ -f "$$ipynb" ] || /opt/conda/bin/jupytext --to notebook "$$f"
+          done && cd /workspace
         done
         echo ">> Starting Jupyter (token: lakehouse)…"
         cd /workspace
